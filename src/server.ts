@@ -1,12 +1,11 @@
 import Fastify from 'fastify';
+import { healthRoutes } from './routes/health.js';
 
 const fastify = Fastify({
     logger: true,
 })
 
-fastify.get('/health', async () => {
-    return { ok: true }
-});
+await fastify.register(healthRoutes);
 
 const port = Number(process.env.PORT) || 3000;
 const host = '0.0.0.0';
