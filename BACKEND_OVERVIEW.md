@@ -104,6 +104,7 @@ Client sends: `POST /auth/verify-code` with body `{ "phoneNumber": "+447...", "c
    ```
 
    This is one SQL statement, so concurrent requests for the same phone number can't race — Postgres serializes them via a row lock. Either a new user is inserted, or the existing row is returned. Either way, `user` is populated.
+
 6. Handler calls `createSession(user.id)` from **`src/sessions/store.ts`**.
 7. `createSession` generates a 32-byte random token via Node's `crypto.randomBytes`, encodes it as base64url, and stores it in Redis:
 
@@ -112,6 +113,7 @@ Client sends: `POST /auth/verify-code` with body `{ "phoneNumber": "+447...", "c
    ```
 
    The `EX 2592000` is the 30-day TTL — Redis will auto-delete the key when it expires.
+
 8. Handler returns `{ "user": {...}, "sessionToken": "<43 chars>" }` with HTTP 200.
 
 **Library functions used:**
@@ -128,7 +130,7 @@ Client sends: `GET /me` with header `Authorization: Bearer <token>`.
 
 **Code path:**
 
-1. Fastify sees the route's `onRequest` hook list and runs **`requireAuth`** from `src/auth/requireAuth.ts` *before* the handler.
+1. Fastify sees the route's `onRequest` hook list and runs **`requireAuth`** from `src/auth/requireAuth.ts` _before_ the handler.
 2. `requireAuth` reads `request.headers.authorization`, checks it starts with `Bearer `, slices off the prefix to get the raw token.
 3. It calls `getSession(token)` from **`src/sessions/store.ts`**, which runs `GET session:<token>` against Redis.
 4. If Redis returns nothing (`null`), `requireAuth` sends `401 Invalid or expired session` and the handler never runs.
@@ -152,7 +154,7 @@ Client sends: `GET /me` with header `Authorization: Bearer <token>`.
 
 ## Production vs local
 
-Identical code, different env vars. Locally, `.env` is loaded by `dotenv-cli` in the `npm run dev` script. On Railway, env vars are set in the dashboard and injected into the process. The `DATABASE_URL` and `REDIS_URL` on Railway are reference variables that resolve to the internal Railway network addresses for the Postgres and Redis services in the same project. Local dev currently uses the *public* URLs to reach the same Postgres and Redis (shared with production — a deliberate shortcut for now).
+Identical code, different env vars. Locally, `.env` is loaded by `dotenv-cli` in the `npm run dev` script. On Railway, env vars are set in the dashboard and injected into the process. The `DATABASE_URL` and `REDIS_URL` on Railway are reference variables that resolve to the internal Railway network addresses for the Postgres and Redis services in the same project. Local dev currently uses the _public_ URLs to reach the same Postgres and Redis (shared with production — a deliberate shortcut for now).
 
 Deployment flow: `git push` → Railway detects the push, clones the repo, runs `npm ci` (install), `npm run build` (TypeScript → JS in `dist/`), `npm start` (runs `node dist/server.js`). Takes about 30 seconds from push to live.
 
