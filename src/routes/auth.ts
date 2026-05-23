@@ -3,8 +3,8 @@ import { sendVerificationCode, checkVerificationCode } from "../twilio/client.js
 import { db } from "../db/client.js";
 import { users } from "../db/schema.js";
 import { eq } from "drizzle-orm";
-import { Body } from "twilio/lib/twiml/MessagingResponse.js";
-import { create } from "node:domain";
+import { createSession } from "../sessions/store.js";
+
 
 
 export async function authRoutes(fastify: FastifyInstance) {
@@ -54,28 +54,19 @@ export async function authRoutes(fastify: FastifyInstance) {
 
 
 
-        const existing = await db
-            .select()
-            .from(users)
-            .where(eq(users.phoneNumber, phoneNumber))
-            .limit(1);
+        const [user] = await db
+            .insert(users)
+            .values({ phoneNumber })
+            .onConflictDoUpdate({
+                target: users.phoneNumber,
+                set: { phoneNumber },
+            })
+            .returning();
 
-        let user;
-        if (existing.length > 0) {
-            user = existing[0];
-        } else {
-            // Code verified. Find or create the user atomically.
-            const [created] = await db
-                .insert(users)
-                .values({ phoneNumber })
-                .onConflictDoUpdate({
-                    target: users.phoneNumber,
-                    set: { phoneNumber }, // no-op update to force a row to be returned
-                })
-                .returning();
-            user = created
-        }
 
-        return reply.code(200).send({ user });
+
+        const sessionToken = await createSession(user.id)
+
+        return reply.code(200).send({ user, sessionToken });
     });
 }
