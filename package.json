@@ -22,7 +22,8 @@
     "fastify": "^5.8.5",
     "ioredis": "^5.10.1",
     "postgres": "^3.4.9",
-    "twilio": "^6.0.2"
+    "twilio": "^6.0.2",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
