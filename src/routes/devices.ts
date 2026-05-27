@@ -90,6 +90,8 @@ export async function deviceRoutes(fastify: FastifyInstance) {
 
       return newDevice;
     });
+
+    return reply.code(201).send({ device });
   })
 
   fastify.post(
