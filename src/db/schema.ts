@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, integer } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, timestamp, integer, boolean, unique } from 'drizzle-orm/pg-core';
 
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -9,12 +9,33 @@ export const users = pgTable('users', {
 
 export const devices = pgTable('devices', {
   id: uuid('id').primaryKey().defaultRandom(),
-  userId: uuid('user_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   deviceName: text('device_name'),
   registrationId: integer('registration_id').notNull(),
   identityKeyPublic: text('identity_key_public').notNull(),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   lastSeen: timestamp('last_seen'),
 });
+
+export const signedPreKeys = pgTable('signed_prekeys', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id, { onDelete: 'cascade' }),
+  keyId: integer('key_id').notNull(),
+  publicKey: text('public_key').notNull(),
+  signature: text('signature').notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => ({
+  uniqueDeviceKeyId: unique().on(table.deviceId, table.keyId),
+}));
+
+export const oneTimePreKeys = pgTable('one_time_prekeys', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id, { onDelete: 'cascade' }),
+  keyId: integer('key_id').notNull(),
+  publicKey: text('public_key').notNull(),
+  used: boolean('used').notNull().default(false),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  usedAt: timestamp('used_at'),
+}, (table) => ({
+  uniqueDeviceKeyId: unique().on(table.deviceId, table.keyId),
+}));
