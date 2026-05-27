@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, integer, boolean, unique } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, timestamp, integer, boolean, unique, index } from 'drizzle-orm/pg-core';
 
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -39,3 +39,23 @@ export const oneTimePreKeys = pgTable('one_time_prekeys', {
 }, (table) => ({
   uniqueDeviceKeyId: unique().on(table.deviceId, table.keyId),
 }));
+
+export const messages = pgTable(
+  'messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    senderDeviceId: uuid('sender_device_id')
+      .notNull()
+      .references(() => devices.id, { onDelete: 'cascade' }),
+    recipientDeviceId: uuid('recipient_device_id')
+      .notNull()
+      .references(() => devices.id, { onDelete: 'cascade' }),
+    ciphertext: text('ciphertext').notNull(),
+    messageType: integer('message_type').notNull().default(0),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    deliveredAt: timestamp('delivered_at'),
+  },
+  (table) => ({
+    recipientIdx: index('messages_recipient_idx').on(table.recipientDeviceId, table.deliveredAt),
+  }),
+);
