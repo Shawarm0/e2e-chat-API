@@ -59,6 +59,30 @@ export async function authRoutes(fastify: FastifyInstance) {
       return reply.code(400).send({ error: 'phoneNumber and code are required' });
     }
 
+    const phoneRL = await checkRateLimit({
+      key: `rl:auth-verify:phone:${phoneNumber}`,
+      limit: 10,
+      windowSeconds: 3600,
+    });
+    if (!phoneRL.allowed) {
+      return reply
+        .code(429)
+        .header('Retry-After', String(phoneRL.retryAfterSeconds))
+        .send({ error: `Too many requests, try again in ${phoneRL.retryAfterSeconds} seconds` });
+    }
+
+    const ipRL = await checkRateLimit({
+      key: `rl:auth-verify:ip:${request.ip}`,
+      limit: 30,
+      windowSeconds: 3600,
+    });
+    if (!ipRL.allowed) {
+      return reply
+        .code(429)
+        .header('Retry-After', String(ipRL.retryAfterSeconds))
+        .send({ error: `Too many requests, try again in ${ipRL.retryAfterSeconds} seconds` });
+    }
+
     let verification;
     try {
       verification = await checkVerificationCode(phoneNumber, code);
