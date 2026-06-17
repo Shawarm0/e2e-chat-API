@@ -10,34 +10,34 @@ import { checkRateLimit } from '../ratelimit/limiter.js';
 const registerDeviceSchema = z.object({
   deviceName: z.string().max(100).optional(),
   registrationId: z.number().int().min(0).max(16383),
-  identityKeyPublic: z.string().min(1),
+  identityKeyPublic: z.string().min(1).max(256),
   signedPreKey: z.object({
     keyId: z.number().int().min(0),
-    publicKey: z.string().min(1),
-    signature: z.string().min(1),
+    publicKey: z.string().min(1).max(256),
+    signature: z.string().min(1).max(512),
   }),
   oneTimePreKeys: z
     .array(
       z.object({
         keyId: z.number().int().min(0),
-        publicKey: z.string().min(1),
+        publicKey: z.string().min(1).max(256),
       })
     )
     .min(1).max(200),
-})
+});
 
 const topupSchema = z.object({
   signedPreKey: z.object({
     keyId: z.number().int().min(0),
-    publicKey: z.string().min(1),
-    signature: z.string().min(1),
+    publicKey: z.string().min(1).max(256),
+    signature: z.string().min(1).max(512),
   })
     .optional(),
   oneTimePreKeys: z
     .array(
       z.object({
         keyId: z.number().int().min(0),
-        publicKey: z.string().min(1),
+        publicKey: z.string().min(1).max(256),
       })
     )
     .min(1).max(200),

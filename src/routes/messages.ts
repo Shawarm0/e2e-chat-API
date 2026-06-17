@@ -10,7 +10,7 @@ import { checkRateLimit } from '../ratelimit/limiter.js';
 const sendMessageSchema = z.object({
   senderDeviceId: z.string().uuid(),
   recipientDeviceId: z.string().uuid(),
-  ciphertext: z.string().min(1),
+  ciphertext: z.string().min(1).max(65536),
   messageType: z.number().int().min(0).max(255).default(0),
 });
 

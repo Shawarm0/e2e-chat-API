@@ -4,18 +4,23 @@ import { db } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { createSession } from '../sessions/store.js';
 import { checkRateLimit } from '../ratelimit/limiter.js';
+import { validateAndNormalizePhone } from '../validation/phone.js';
 
 export async function authRoutes(fastify: FastifyInstance) {
   fastify.post<{
     Body: { phoneNumber: string };
   }>('/auth/request-code', async (request, reply) => {
-    const { phoneNumber } = request.body;
+    const { phoneNumber: rawPhone } = request.body;
 
-    if (!phoneNumber || !phoneNumber.startsWith('+')) {
-      return reply.code(400).send({
-        error: 'phoneNumber is required and must be in E.164 format (e.g.+4477700090)',
-      });
+    if (!rawPhone) {
+      return reply.code(400).send({ error: 'phoneNumber is required' });
     }
+
+    const phoneResult = validateAndNormalizePhone(rawPhone);
+    if (!phoneResult.valid) {
+      return reply.code(400).send({ error: phoneResult.reason });
+    }
+    const phoneNumber = phoneResult.e164;
 
     const phoneRL = await checkRateLimit({
       key: `rl:auth-req:phone:${phoneNumber}`,
@@ -53,11 +58,17 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.post<{
     Body: { phoneNumber: string; code: string };
   }>('/auth/verify-code', async (request, reply) => {
-    const { phoneNumber, code } = request.body;
+    const { phoneNumber: rawPhone, code } = request.body;
 
-    if (!phoneNumber || !code) {
+    if (!rawPhone || !code) {
       return reply.code(400).send({ error: 'phoneNumber and code are required' });
     }
+
+    const phoneResult = validateAndNormalizePhone(rawPhone);
+    if (!phoneResult.valid) {
+      return reply.code(400).send({ error: phoneResult.reason });
+    }
+    const phoneNumber = phoneResult.e164;
 
     const phoneRL = await checkRateLimit({
       key: `rl:auth-verify:phone:${phoneNumber}`,
