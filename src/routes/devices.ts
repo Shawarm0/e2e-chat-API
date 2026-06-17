@@ -4,6 +4,7 @@ import { db } from "../db/client.js";
 import { devices, signedPreKeys, oneTimePreKeys } from '../db/schema.js'
 import { requireAuth } from "../auth/requireAuth.js";
 import { eq, and } from 'drizzle-orm';
+import { checkRateLimit } from '../ratelimit/limiter.js';
 
 
 const registerDeviceSchema = z.object({
@@ -51,6 +52,18 @@ const deviceParamsSchema = z.object({
 export async function deviceRoutes(fastify: FastifyInstance) {
   fastify.post('/devices', { onRequest: [requireAuth] }, async (request, reply) => {
     const userId = request.session!.userId;
+
+    const rl = await checkRateLimit({
+      key: `rl:dev:register:${userId}`,
+      limit: 5,
+      windowSeconds: 3600,
+    });
+    if (!rl.allowed) {
+      return reply
+        .code(429)
+        .header('Retry-After', String(rl.retryAfterSeconds))
+        .send({ error: `Too many requests, try again in ${rl.retryAfterSeconds} seconds` });
+    }
 
     const parseResult = registerDeviceSchema.safeParse(request.body);
     if (!parseResult.success) {
@@ -118,6 +131,18 @@ export async function deviceRoutes(fastify: FastifyInstance) {
 
       const { deviceId } = paramsParse.data;
       const data = bodyParse.data;
+
+      const rl = await checkRateLimit({
+        key: `rl:dev:prekeys:${deviceId}`,
+        limit: 30,
+        windowSeconds: 3600,
+      });
+      if (!rl.allowed) {
+        return reply
+          .code(429)
+          .header('Retry-After', String(rl.retryAfterSeconds))
+          .send({ error: `Too many requests, try again in ${rl.retryAfterSeconds} seconds` });
+      }
 
       // Authorization: the device must belong to the authenticated user.
       const [device] = await db

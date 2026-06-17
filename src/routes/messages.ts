@@ -5,6 +5,7 @@ import { db } from '../db/client.js';
 import { devices, messages } from '../db/schema.js';
 import { requireAuth } from '../auth/requireAuth.js';
 import { deliverToDevice } from '../realtime/delivery.js';
+import { checkRateLimit } from '../ratelimit/limiter.js';
 
 const sendMessageSchema = z.object({
   senderDeviceId: z.string().uuid(),
@@ -34,6 +35,18 @@ export async function messageRoutes(fastify: FastifyInstance) {
       return reply.code(400).send({ error: 'Invalid request body', issues: parsed.error.issues });
     }
     const data = parsed.data;
+
+    const rl = await checkRateLimit({
+      key: `rl:msg:send:${data.senderDeviceId}`,
+      limit: 60,
+      windowSeconds: 60,
+    });
+    if (!rl.allowed) {
+      return reply
+        .code(429)
+        .header('Retry-After', String(rl.retryAfterSeconds))
+        .send({ error: `Too many requests, try again in ${rl.retryAfterSeconds} seconds` });
+    }
 
     // The sender device must belong to the authenticated user.
     const [senderDevice] = await db
