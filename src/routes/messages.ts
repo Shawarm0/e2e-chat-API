@@ -4,6 +4,7 @@ import { and, eq, isNull, inArray, asc, gt } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { devices, messages } from '../db/schema.js';
 import { requireAuth } from '../auth/requireAuth.js';
+import { deliverToDevice } from '../realtime/delivery.js';
 
 const sendMessageSchema = z.object({
   senderDeviceId: z.string().uuid(),
@@ -63,6 +64,10 @@ export async function messageRoutes(fastify: FastifyInstance) {
         messageType: data.messageType,
       })
       .returning();
+
+    // Attempt realtime push. The message is already durable in Postgres;
+    // this is the fast path, not the only path.
+    const deliveryStatus = await deliverToDevice(data.recipientDeviceId, message);
 
     return reply.code(201).send({ message });
   });
