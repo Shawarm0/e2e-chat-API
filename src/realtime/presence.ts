@@ -1,5 +1,6 @@
 import { redis } from '../redis/client.js';
 import { INSTANCE_ID } from './instance.js';
+import { logger } from '../logger.js';
 
 const PRESENCE_TTL_SECONDS = 60;
 const PRESENCE_REFRESH_INTERVAL_MS = 30_000;
@@ -31,7 +32,7 @@ export function startPresenceRefresher(getActiveDeviceIds: () => Iterable<string
       try {
         await redis.set(presenceKey(deviceId), INSTANCE_ID, 'EX', PRESENCE_TTL_SECONDS);
       } catch (err) {
-        console.error('Failed to refresh presence for', deviceId, err);
+        logger.error({ err, deviceId }, 'Failed to refresh presence');
       }
     }
   }, PRESENCE_REFRESH_INTERVAL_MS);

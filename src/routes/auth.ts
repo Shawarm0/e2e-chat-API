@@ -45,7 +45,7 @@ export async function authRoutes(fastify: FastifyInstance) {
       const verification = await sendVerificationCode(phoneNumber);
       return reply.code(200).send({ status: verification.status });
     } catch (err) {
-      fastify.log.error({ err, phoneNumber }, 'Failed to send verification code');
+      request.log.error({ err, phoneNumber }, 'Failed to send verification code');
       return reply.code(500).send({ error: 'Failed to send verification code' });
     }
   });
@@ -87,7 +87,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     try {
       verification = await checkVerificationCode(phoneNumber, code);
     } catch (err) {
-      fastify.log.error({ err, phoneNumber }, 'Failed to check verification code');
+      request.log.error({ err, phoneNumber }, 'Failed to check verification code');
       return reply.code(500).send({ error: 'Failed to check verification code' });
     }
 

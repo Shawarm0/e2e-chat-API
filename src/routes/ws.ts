@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { randomUUID } from 'node:crypto';
 import websocketPlugin, { type WebSocket } from '@fastify/websocket';
 import { and, eq, isNull, asc, inArray } from 'drizzle-orm';
 import { db } from '../db/client.js';
@@ -43,7 +44,8 @@ async function flushBacklog(socket: WebSocket, deviceId: string): Promise<void> 
 export async function wsRoutes(fastify: FastifyInstance) {
   await fastify.register(websocketPlugin);
 
-  fastify.get('/ws', { websocket: true }, (socket /* WebSocket */, _req) => {
+  fastify.get('/ws', { websocket: true }, (socket /* WebSocket */, req) => {
+    const wsLog = req.log.child({ wsConnectionId: randomUUID() });
     let authedDeviceId: string | null = null;
     let authTimeout: NodeJS.Timeout | null = setTimeout(() => {
       if (!authedDeviceId) {
@@ -141,7 +143,7 @@ export async function wsRoutes(fastify: FastifyInstance) {
     });
 
     socket.on('error', (err: Error) => {
-      fastify.log.error({ err, authedDeviceId }, 'websocket error');
+      wsLog.error({ err, authedDeviceId }, 'websocket error');
     });
   });
 }

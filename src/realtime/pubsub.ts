@@ -1,6 +1,7 @@
 import { Redis } from 'ioredis';
 import { INSTANCE_ID } from './instance.js';
 import { getLocalSocket } from './registry.js';
+import { logger } from '../logger.js';
 
 const PUBSUB_PREFIX = 'instance:';
 
@@ -19,12 +20,12 @@ const subscriber = new Redis(redisUrl, { maxRetriesPerRequest: 3 });
 const publisher = new Redis(redisUrl, { maxRetriesPerRequest: 3 });
 
 subscriber.on('error', (err: Error) => {
-  console.error('Redis subscriber error:', err);
+  logger.error({ err }, 'Redis subscriber error');
 });
 
 
 publisher.on('error', (err: Error) => {
-  console.error('Redis publisher error:', err);
+  logger.error({ err }, 'Redis publisher error');
 });
 
 subscriber.on('message', (_channel: string, raw: string) => {
@@ -58,7 +59,7 @@ export async function initPubSub(): Promise<void> {
     try {
       socket.send(JSON.stringify({ type: 'message', message: payload.message }));
     } catch (err) {
-      console.error('Failed to deliver message to local socket', err);
+      logger.error({ err, deviceId: payload.deviceId }, 'Failed to deliver message to local socket');
     }
   });
 }

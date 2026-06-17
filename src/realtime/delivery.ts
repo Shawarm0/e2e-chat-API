@@ -2,6 +2,7 @@ import { INSTANCE_ID } from './instance.js';
 import { getLocalSocket } from './registry.js';
 import { lookupInstance } from './presence.js';
 import { publishToInstance } from './pubsub.js';
+import { logger } from '../logger.js';
 
 export async function deliverToDevice(
   deviceId: string,
@@ -14,7 +15,7 @@ export async function deliverToDevice(
       localSocket.send(JSON.stringify({ type: 'message', message }));
       return 'delivered_local';
     } catch (err) {
-      console.error('Local send failed for', deviceId, err);
+      logger.error({ err, deviceId }, 'Local WebSocket send failed');
     }
   }
 
@@ -29,7 +30,7 @@ export async function deliverToDevice(
     await publishToInstance(owningInstance, { deviceId, message });
     return 'delivered_remote';
   } catch (err) {
-    console.error('Cross-instance publish failed for', deviceId, err);
+    logger.error({ err, deviceId }, 'Cross-instance publish failed');
     return 'offline';
   }
 }
