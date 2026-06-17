@@ -1,51 +1,67 @@
 # e2e-chat-API — Backend Overview
 
-A short tour of what exists, where it lives, and which code runs when.
+A tour of what exists, where it lives, and which code runs when.
 
 ---
 
 ## Current state
 
-A Fastify backend in TypeScript, deployed to Railway. It supports phone-number authentication via Twilio SMS, and issues session tokens stored in Redis. User accounts and devices live in Postgres. No messaging logic yet — that comes next.
+A Fastify backend in TypeScript, deployed to Railway. Supports phone-number authentication via Twilio Verify, session tokens stored in Redis, device registration with Signal-Protocol-shaped cryptographic keys, prekey bundle distribution, message storage and delivery, and a realtime WebSocket layer that pushes messages to connected devices.
+
+The server never sees plaintext. It stores ciphertext blobs, hands out public keys, and routes opaque messages between device "mailboxes." All encryption work happens on clients (when there are real clients).
 
 ### Tech stack
 
 - **Fastify** — HTTP web framework.
+- **@fastify/websocket** — WebSocket plugin layered on top.
 - **Drizzle ORM** + **postgres** — typed database access against PostgreSQL.
-- **ioredis** — Redis client for ephemeral state.
+- **ioredis** — Redis client for sessions, presence, and pub/sub.
 - **Twilio Verify** — SMS one-time code delivery and validation.
-- **TypeScript** + **tsx** — types in dev, compiled to JS for production.
+- **Zod** — request validation.
+- **TypeScript** + **tsx** — types in dev, compiled JS for production.
 
 ### Project structure
 
 ```
 src/
-├── server.ts              entry point — boots Fastify, registers routes
+├── server.ts                 entry point — boots Fastify, registers routes, starts realtime
 ├── auth/
-│   └── requireAuth.ts     hook that validates session tokens on protected routes
+│   └── requireAuth.ts        hook that validates session tokens on protected REST routes
 ├── db/
-│   ├── client.ts          opens the Postgres connection
-│   └── schema.ts          users + devices table definitions
+│   ├── client.ts             opens the Postgres connection
+│   └── schema.ts             users, devices, prekeys, signed_prekeys, messages
 ├── redis/
-│   └── client.ts          opens the Redis connection
+│   └── client.ts             opens the main Redis connection (commands)
+├── realtime/
+│   ├── instance.ts           per-process random UUID (INSTANCE_ID)
+│   ├── registry.ts           in-process Map<deviceId, WebSocket>
+│   ├── presence.ts           Redis presence keys + TTL refresher
+│   ├── pubsub.ts             cross-instance message routing via Redis pub/sub
+│   └── delivery.ts           "deliver to device wherever it is" composed helper
 ├── routes/
-│   ├── health.ts          GET /health
-│   ├── auth.ts            POST /auth/request-code, POST /auth/verify-code
-│   └── me.ts              GET /me (protected)
+│   ├── health.ts             GET /health
+│   ├── auth.ts               POST /auth/request-code, POST /auth/verify-code
+│   ├── me.ts                 GET /me (protected)
+│   ├── devices.ts            POST /devices, POST /devices/:deviceId/prekeys
+│   ├── keys.ts               GET /keys/:userId (consumes a one-time prekey)
+│   ├── messages.ts           POST /messages, GET /messages, POST /messages/ack
+│   └── ws.ts                 GET /ws (WebSocket: auth frame, message frames, ack frames)
 ├── sessions/
-│   └── store.ts           createSession, getSession, revokeSession
+│   └── store.ts              createSession, getSession, revokeSession (Redis-backed)
 └── twilio/
-    └── client.ts          sendVerificationCode, checkVerificationCode
+    └── client.ts             sendVerificationCode, checkVerificationCode
 ```
 
-### Environment variables (loaded from `.env` locally, Railway dashboard in production)
+### Environment variables
+
+Loaded from `.env` locally (gitignored) and set in the Railway dashboard in production.
 
 - `DATABASE_URL` — Postgres connection string.
 - `REDIS_URL` — Redis connection string.
 - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_VERIFY_SERVICE_SID` — Twilio credentials.
 - `PORT` — set by Railway in production; defaults to 3000 locally.
 
-Every module that needs these reads them from `process.env` at startup and throws immediately if they are missing. This is fail-fast — a misconfigured deployment crashes loudly instead of silently misbehaving.
+Every module that needs these reads `process.env` at startup and crashes immediately if anything's missing. Fail-fast on misconfiguration.
 
 ---
 
@@ -53,119 +69,252 @@ Every module that needs these reads them from `process.env` at startup and throw
 
 When the server process boots:
 
-1. **`src/server.ts` runs.** It imports the route modules. Each route import triggers its own imports, which is how the database, Redis, and Twilio clients get created.
-2. **`src/db/client.ts` runs once.** Reads `DATABASE_URL`, opens a Postgres connection pool (via the `postgres` library), wraps it in Drizzle's typed query builder, exports `db`. The pool holds ~10 open TCP connections to reuse across requests.
-3. **`src/redis/client.ts` runs once.** Reads `REDIS_URL`, opens an `ioredis` connection, exports `redis`.
-4. **`src/twilio/client.ts` runs once.** Reads the three Twilio env vars, constructs a Twilio client, exports two helper functions (`sendVerificationCode`, `checkVerificationCode`).
-5. **`server.ts` registers the route plugins.** Each call to `fastify.register(...)` invokes a function that attaches routes to the Fastify instance.
-6. **`fastify.listen(...)`** opens the HTTP socket on the chosen port and starts accepting connections.
+1. **`src/server.ts` runs.** It imports route modules and realtime helpers. Each import triggers module initialisation, opening the Postgres pool, Redis connection, Twilio client, and pub/sub connections.
+2. **`INSTANCE_ID` is generated** — a random UUID unique to this process. Used as the value in presence keys.
+3. **Routes are registered** via `fastify.register(...)`. Each `routes/*.ts` module attaches its handlers.
+4. **`initPubSub()` runs.** Subscribes the process to its own `instance:<id>` Redis channel. Other instances will publish there to route messages across processes.
+5. **`startPresenceRefresher(...)` runs.** Sets up a recurring task that re-writes the TTL on every locally-connected device's presence key every 30 seconds.
+6. **`fastify.listen(...)`** opens the HTTP socket. Both REST and WebSocket connections come in here; Fastify handles the upgrade for `/ws` automatically.
 
-After this, the process sits in the Node event loop, waiting for requests. Connections to Postgres, Redis, and Twilio stay open in the background.
+After this, the process sits in the Node event loop. Connections to Postgres, Redis (one for normal commands, two more for pub/sub), and Twilio stay open in the background.
 
 ---
 
-## User flow 1: requesting an SMS code
+## User flows
+
+### Flow 1: requesting an SMS code
 
 Client sends: `POST /auth/request-code` with body `{ "phoneNumber": "+447..." }`.
 
-**Code path:**
+1. Handler in `src/routes/auth.ts` runs.
+2. Validates the body (Zod).
+3. Calls `sendVerificationCode(phone)` in `src/twilio/client.ts`.
+4. Twilio generates the code, sends the SMS, returns `{status: "pending"}`.
+5. Handler returns `{ "status": "pending" }` with HTTP 200.
 
-1. Fastify routes the request to the handler in **`src/routes/auth.ts`**.
-2. Handler validates the body — phone number is present and starts with `+`. If not, returns `400`.
-3. Handler calls `sendVerificationCode(phoneNumber)` from **`src/twilio/client.ts`**.
-4. That function calls `twilioClient.verify.v2.services(SID).verifications.create({ to, channel: 'sms' })` — the Twilio SDK makes an HTTPS request to Twilio's API. Twilio generates the code, sends the SMS, and returns a verification record with `status: "pending"`.
-5. Handler returns `{ "status": "pending" }` to the client with HTTP 200.
+### Flow 2: verifying the code
 
-**Where things come from:** the handler accesses `db`, `sendVerificationCode`, etc. via ESM imports at the top of the file. Those imports run the respective `client.ts` files once (Node caches the module), so the connection setup happens at boot rather than per-request.
+Client sends: `POST /auth/verify-code` with body `{ "phoneNumber", "code" }`.
 
-**Library functions used:**
+1. Handler validates input.
+2. Calls `checkVerificationCode(phone, code)`. Twilio responds with `status: "approved"` or `"pending"` (latter on wrong code or expired).
+3. Not approved → 401.
+4. Approved → atomic upsert on `users` (`INSERT ... ON CONFLICT DO UPDATE ... RETURNING`). Returns the user, new or existing.
+5. `createSession(userId)` generates a 32-byte random token, stores it in Redis as `session:<token> → JSON` with 30-day TTL.
+6. Returns `{ user, sessionToken }`.
 
-- `twilio()` — constructs an authenticated HTTP client for Twilio's API.
-- `verifications.create()` — POSTs to `https://verify.twilio.com/v2/Services/.../Verifications` under the hood.
+### Flow 3: registering a device
 
----
+Client (authenticated) sends: `POST /devices` with body containing `registrationId`, `identityKeyPublic`, `signedPreKey`, and an array of `oneTimePreKeys`.
 
-## User flow 2: verifying the code
+1. `requireAuth` hook validates the Bearer token.
+2. Handler in `src/routes/devices.ts` validates body (Zod).
+3. Opens a Postgres transaction.
+4. INSERT into `devices`. INSERT one signed prekey. INSERT all one-time prekeys.
+5. If any step fails, the whole thing rolls back — no half-registered devices.
+6. Returns the new device row with HTTP 201.
 
-Client sends: `POST /auth/verify-code` with body `{ "phoneNumber": "+447...", "code": "123456" }`.
+### Flow 4: fetching a prekey bundle
 
-**Code path:**
+Client (authenticated) sends: `GET /keys/:userId`.
 
-1. Handler in **`src/routes/auth.ts`** validates both fields are present (`400` if not).
-2. Handler calls `checkVerificationCode(phoneNumber, code)` from **`src/twilio/client.ts`**, which hits Twilio's `VerificationCheck` endpoint.
-3. Twilio returns `{ status: "approved" }` if the code matches, `{ status: "pending" }` otherwise.
-4. If not approved, handler returns `401 Invalid code`.
-5. If approved, handler runs an atomic upsert against the `users` table:
-
-   ```ts
-   INSERT INTO users (phone_number) VALUES ($1)
-   ON CONFLICT (phone_number) DO UPDATE SET phone_number = $1
+1. `requireAuth` validates the Bearer token.
+2. Handler in `src/routes/keys.ts` finds the most recently registered device for the target user.
+3. Finds the most recent signed prekey for that device.
+4. Runs an atomic claim of one unused one-time prekey:
+   ```sql
+   UPDATE one_time_prekeys
+   SET used = true, used_at = now()
+   WHERE id = (SELECT id FROM one_time_prekeys
+               WHERE device_id = $1 AND used = false
+               ORDER BY key_id ASC LIMIT 1
+               FOR UPDATE SKIP LOCKED)
    RETURNING *
    ```
+   `SKIP LOCKED` means concurrent requests grab different prekeys instead of waiting on each other.
+5. Returns `{ deviceId, registrationId, identityKey, signedPreKey, preKey }`. `preKey` may be `null` if the pool is exhausted — the Signal handshake still works, just with slightly weaker forward secrecy.
 
-   This is one SQL statement, so concurrent requests for the same phone number can't race — Postgres serializes them via a row lock. Either a new user is inserted, or the existing row is returned. Either way, `user` is populated.
+### Flow 5: sending a message (REST)
 
-6. Handler calls `createSession(user.id)` from **`src/sessions/store.ts`**.
-7. `createSession` generates a 32-byte random token via Node's `crypto.randomBytes`, encodes it as base64url, and stores it in Redis:
+Client (authenticated) sends: `POST /messages` with `{ senderDeviceId, recipientDeviceId, ciphertext, messageType }`.
 
-   ```
-   SET session:<token> '{"userId":"...","createdAt":...}' EX 2592000
-   ```
+1. Handler in `src/routes/messages.ts` validates input.
+2. Verifies sender device belongs to the authenticated user.
+3. Verifies recipient device exists (any user).
+4. INSERTs into `messages` (`delivered_at` defaults to `null`).
+5. Calls `deliverToDevice(recipientDeviceId, message)`:
+   - First checks local socket Map. If found, writes the JSON frame and returns `"delivered_local"`.
+   - Otherwise looks up `presence:device:<id>` in Redis to find which instance the device is connected to. If a remote instance, publishes to `instance:<that_uuid>` and returns `"delivered_remote"`.
+   - If no socket and no presence, returns `"offline"`. Message stays in Postgres for the recipient to fetch later.
+6. Returns `{ message, delivery }` with HTTP 201.
 
-   The `EX 2592000` is the 30-day TTL — Redis will auto-delete the key when it expires.
+### Flow 6: realtime delivery (WebSocket)
 
-8. Handler returns `{ "user": {...}, "sessionToken": "<43 chars>" }` with HTTP 200.
+Client opens `wss://.../ws`.
 
-**Library functions used:**
+1. The HTTP upgrade succeeds. Handler in `src/routes/ws.ts` runs once.
+2. Client immediately sends `{ "type": "auth", "token", "deviceId" }`.
+3. Server validates the session and that the device belongs to the user.
+4. Server registers the socket in the in-process Map (`setLocalSocket`).
+5. Server writes `presence:device:<id> = INSTANCE_ID` with 60s TTL.
+6. Server sends `{ "type": "auth_ok" }` to the client.
+7. Server runs `flushBacklog(deviceId)` — SELECTs all undelivered messages for the device and writes them as `{ "type": "message", "message": ... }` frames.
+8. Going forward, any message inserted via `POST /messages` whose recipient is this device gets pushed down the open socket either directly or via pub/sub.
+9. Client acks delivered messages with `{ "type": "ack", "messageIds": [...] }`. Server UPDATEs `delivered_at` for those IDs (only if they're actually addressed to the connected device).
 
-- `db.insert(...).values(...).onConflictDoUpdate(...).returning()` — Drizzle's query builder. Compiles to a single parameterized SQL statement; the values are passed as separate parameters so user input can't escape into SQL syntax (no injection possible).
-- `randomBytes(32)` — Node's built-in cryptographic randomness, drawn from the OS entropy pool.
-- `redis.set(key, value, 'EX', seconds)` — Redis `SET` with expiry, atomic in one command.
+On disconnect (`socket.on('close')`):
+- Local socket Map entry cleared.
+- Presence key in Redis deleted (but only if we still own it — defends against reconnect races).
+- The 30s presence refresher stops touching the key.
 
----
+### Flow 7: catching up via REST (when WebSocket isn't available)
 
-## User flow 3: hitting a protected route
-
-Client sends: `GET /me` with header `Authorization: Bearer <token>`.
-
-**Code path:**
-
-1. Fastify sees the route's `onRequest` hook list and runs **`requireAuth`** from `src/auth/requireAuth.ts` _before_ the handler.
-2. `requireAuth` reads `request.headers.authorization`, checks it starts with `Bearer `, slices off the prefix to get the raw token.
-3. It calls `getSession(token)` from **`src/sessions/store.ts`**, which runs `GET session:<token>` against Redis.
-4. If Redis returns nothing (`null`), `requireAuth` sends `401 Invalid or expired session` and the handler never runs.
-5. If a session is found, `requireAuth` parses the JSON, assigns it to `request.session`, and returns without sending a reply — letting Fastify continue to the handler.
-6. The handler in **`src/routes/me.ts`** reads `request.session.userId`, runs a SELECT against Postgres to fetch the user, and returns it as JSON.
-
-**Library functions used:**
-
-- `redis.get(key)` — straight Redis lookup; sub-millisecond.
-- `db.select().from(users).where(eq(users.id, ...)).limit(1)` — Drizzle's SELECT builder. The `eq()` function returns a typed SQL expression object, not a string, which is what makes the query injection-safe.
+`GET /messages?deviceId=...&since=...&limit=...` returns undelivered messages for the device, ordered by `createdAt` ascending. `POST /messages/ack` flips `delivered_at`. This is the REST fallback for clients without a live WebSocket. Same storage, different channel.
 
 ---
 
 ## How the pieces share state
 
-- **Connection objects (`db`, `redis`, Twilio client)** are created once at module load. They are imported by route files via `import { db } from '../db/client.js';`. Node caches modules, so every file that imports `db` gets the same instance.
-- **Per-request state** lives on the `request` object. The `requireAuth` hook attaches `request.session`; route handlers read it. This is scoped to one request — no global mutable state, no risk of one user seeing another user's session.
-- **Cross-request state** lives in Postgres (durable: users, devices) or Redis (ephemeral: sessions, later presence and rate limits). The server processes themselves are stateless — restart any instance, no data lost.
+- **Connection objects** (`db`, `redis`, Twilio client, pub/sub clients) are module-scope singletons created once at process startup. Route files import them.
+- **Per-request state** lives on Fastify's `request` object — `request.session` for REST routes after `requireAuth`. For WebSocket connections, the per-connection state (`authedDeviceId`) lives in the closure of the connection handler.
+- **Cross-request, durable state** (users, devices, keys, messages) lives in Postgres.
+- **Cross-request, ephemeral state** (sessions, presence, pending operations) lives in Redis. Auto-expires via TTL.
+- **Cross-process state** lives in Redis only. The in-process socket Map is local to each Node process; the pub/sub layer is how processes talk to each other.
 
 ---
 
 ## Production vs local
 
-Identical code, different env vars. Locally, `.env` is loaded by `dotenv-cli` in the `npm run dev` script. On Railway, env vars are set in the dashboard and injected into the process. The `DATABASE_URL` and `REDIS_URL` on Railway are reference variables that resolve to the internal Railway network addresses for the Postgres and Redis services in the same project. Local dev currently uses the _public_ URLs to reach the same Postgres and Redis (shared with production — a deliberate shortcut for now).
+Same code, different env vars. Locally, `.env` is loaded by `dotenv-cli` in the `npm run dev` script. On Railway, env vars are set in the dashboard. `DATABASE_URL` and `REDIS_URL` resolve to internal Railway network addresses in production, public proxy URLs locally (since local dev shares the production DB — a deliberate shortcut).
 
-Deployment flow: `git push` → Railway detects the push, clones the repo, runs `npm ci` (install), `npm run build` (TypeScript → JS in `dist/`), `npm start` (runs `node dist/server.js`). Takes about 30 seconds from push to live.
+Deployment flow: `git push` → CI runs (`npm ci`, lint, type-check, build) → on green, Railway clones, runs `npm ci`, `npm run build`, then `npm start`. Live in about 90 seconds.
+
+---
+
+## Hardening — implemented
+
+(See "Hardening — planned" below for the work currently being done.)
+
+- **Atomic operations** — find-or-create user, prekey consumption, message ack are all single SQL statements with row-level locking where it matters. No TOCTOU windows.
+- **Authorization on every protected endpoint** — `requireAuth` for REST, in-band auth for WebSocket. Ownership checks (this device must belong to this user) on every mutation.
+- **No data leak in 404s vs 403s** — looking up a resource that exists-but-isn't-yours returns 404, not 403, to avoid enumeration attacks.
+- **Cryptographic randomness everywhere** — session tokens and instance IDs use `crypto.randomBytes` / `crypto.randomUUID`. No `Math.random()` for security-sensitive values.
+- **Fail-fast configuration** — every module that depends on env vars throws on startup if they're missing.
+- **CI gate on deploys** — Railway waits for GitHub Actions to pass before promoting a build. Broken code doesn't reach production.
 
 ---
 
 ## What's not built yet
 
-- Device registration (each user can have multiple devices, each with its own keypair).
-- Prekey bundles and the X3DH handshake — the Signal Protocol's session-setup mechanism.
-- WebSocket gateway for realtime delivery.
-- Message send/receive, history, fan-out for groups.
-- Push notifications.
-- Rate limiting on auth endpoints.
-- Separate dev and prod databases.
+Roughly in the order they'd be added:
+
+- **Hardening continued** — rate limiting on `/auth/*`, abuse handling, separation of dev and prod databases, cleanup cron for used prekeys, structured error logging.
+- **Multi-device fan-out for `GET /keys/:userId`** — return all of a user's devices in one bundle. See appendix.
+- **Groups** — `groups` and `group_members` tables, sender-key distribution, fan-out per group send. See appendix.
+- **Media** — encrypted file uploads to object storage, referenced from message ciphertexts.
+- **Push notifications** — APNs/FCM wake-ups for offline devices.
+- **A real client** — replace the base64 stub with a real Signal Protocol client (libsignal-client) on a mobile or web platform.
+
+---
+
+# Appendix: Future features (design sketches)
+
+These features aren't required for the current scope but the design is sketched here so they can be implemented later without re-thinking the architecture.
+
+## Multi-device fan-out
+
+**Problem.** Right now `GET /keys/:userId` returns a bundle for one device — the most recently registered. If a user has a phone *and* a laptop, only one device is reachable. Real WhatsApp/Signal let users have multiple devices that all receive messages simultaneously.
+
+**The shape of the change.**
+
+The schema doesn't need to change — `devices` already supports many devices per user. The work is in three places:
+
+1. **`GET /keys/:userId` returns an array.** Instead of `{ deviceId, registrationId, identityKey, signedPreKey, preKey }`, return `{ devices: [ {...bundle for device 1}, {...bundle for device 2}, ... ] }`. Each entry consumes its own one-time prekey atomically.
+
+2. **The sender encrypts the same plaintext N times.** Once per recipient device. This is sender-side fan-out, performed entirely on the client. The server still receives N independent ciphertexts (one per recipient device) via N independent `POST /messages` calls.
+
+3. **The sender's own other devices also need a copy.** If Alice has a phone and a laptop and sends from her phone, the laptop needs to see "you sent: hello" in the conversation. So Alice's phone also fetches her own user's key bundle and encrypts to each of her *other* devices. This is "self-fanout."
+
+**Implementation notes.**
+
+- The one-time prekey consumption query stays the same per-device; we just run it N times in a single endpoint call. Wrap in a transaction so either all bundles succeed or none do.
+- The bundle endpoint should handle a device with no unused prekeys gracefully — return the rest of the bundle with `preKey: null`. The X3DH handshake still works without a one-time prekey, just with weaker forward secrecy.
+- Add a query parameter `?exclude=<deviceId>` so a client doesn't fetch a bundle for the calling device itself.
+- Sender fan-out is a client concern, not a server one. The server doesn't change for sender fan-out beyond returning the right bundles.
+
+**What this unlocks.** Users can install the app on multiple devices and have all of them receive every message. "WhatsApp Web alongside the phone" pattern.
+
+**Estimated effort.** ~1-2 hours. Mostly small surgery in `keys.ts`, a transaction wrapper, and adjusting the response shape.
+
+## Groups
+
+**Problem.** Currently messages are 1:1 — one sender device to one recipient device. Groups in Signal-style systems use **sender keys**: each group member has a long-lived symmetric key for that group, distributed to other members via individual pairwise Signal sessions. Group messages are encrypted *once* with the sender's sender-key, then delivered to every other member via the normal per-device mailbox.
+
+**Schema additions.**
+
+```ts
+export const groups = pgTable('groups', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: text('name'),
+  createdBy: uuid('created_by').notNull().references(() => users.id),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+export const groupMembers = pgTable('group_members', {
+  groupId: uuid('group_id').notNull().references(() => groups.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  joinedAt: timestamp('joined_at').notNull().defaultNow(),
+  role: text('role').notNull().default('member'), // 'admin' | 'member'
+}, (table) => ({
+  pk: primaryKey({ columns: [table.groupId, table.userId] }),
+}));
+```
+
+Note the server does *not* store any group cryptographic state. Sender keys live on clients; the server only knows membership.
+
+**Endpoints.**
+
+- `POST /groups` — create a group, body `{ name, memberUserIds }`. Returns the new group ID.
+- `POST /groups/:groupId/members` — add members (admin only).
+- `DELETE /groups/:groupId/members/:userId` — remove a member.
+- `GET /groups/:groupId` — get group metadata and member list.
+- `GET /groups` — list groups the calling user is in.
+
+**Message-send change.**
+
+`POST /messages` gets an optional `groupId` field. When present, the server:
+
+1. Verifies the sender is a member of the group.
+2. Looks up all member user IDs.
+3. For each member, looks up all their devices (excluding the sender's own device).
+4. **The client is responsible for providing one ciphertext per recipient device.** The body for a group send looks like:
+
+   ```ts
+   {
+     groupId: "...",
+     senderDeviceId: "...",
+     deliveries: [
+       { recipientDeviceId: "...", ciphertext: "...", messageType: 0 },
+       { recipientDeviceId: "...", ciphertext: "...", messageType: 0 },
+       ...
+     ]
+   }
+   ```
+
+5. Server inserts one row per delivery, then attempts realtime push on each one. Wrap in a transaction.
+
+**Sender-key distribution.**
+
+When a new member joins, every existing member's client must send the new member a copy of their sender key — via a pairwise Signal session (so a normal `POST /messages` with `messageType` set to a "sender-key distribution" type). The server doesn't know this is happening; it's just routing ciphertext.
+
+When a member leaves, all remaining members must rotate their sender keys (otherwise the kicked member could still decrypt future messages from cached state). Again, this is a client concern; the server's only job is to inform other members via a message that the kick happened so they know to rotate.
+
+**Implementation notes.**
+
+- The "one ciphertext per recipient device" pattern means a 50-person group with average 1.5 devices each becomes ~75 message inserts per send. Wrap the whole thing in a single transaction so partial failures roll back cleanly.
+- Add a separate `group_messages` table or just keep using `messages` — the latter is simpler; you can JOIN through `group_members` to figure out group context if needed for analytics. Probably add an optional `group_id` column on `messages` for ergonomic lookups ("show me all messages from this group across my devices").
+- The fan-out makes sends expensive. For groups beyond a few hundred members, you'd switch to a different distribution strategy (e.g. dropping members into a queue and fanning out asynchronously). Not a concern at the scale we're discussing.
+
+**What this unlocks.** Group chats. The hardest features (consistent membership across all devices, key rotation on member changes, large-group performance) are mostly client-side or operational, not architectural — the server stays a dumb relay.
+
+**Estimated effort.** ~1 full day for the minimum-viable version. More if you want admin transfer, group avatars, etc.
