@@ -2,8 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import { sendVerificationCode, checkVerificationCode } from '../twilio/client.js';
 import { db } from '../db/client.js';
 import { users } from '../db/schema.js';
-import { eq } from 'drizzle-orm';
 import { createSession } from '../sessions/store.js';
+import { checkRateLimit } from '../ratelimit/limiter.js';
 
 export async function authRoutes(fastify: FastifyInstance) {
   fastify.post<{
@@ -15,6 +15,30 @@ export async function authRoutes(fastify: FastifyInstance) {
       return reply.code(400).send({
         error: 'phoneNumber is required and must be in E.164 format (e.g.+4477700090)',
       });
+    }
+
+    const phoneRL = await checkRateLimit({
+      key: `rl:auth-req:phone:${phoneNumber}`,
+      limit: 3,
+      windowSeconds: 3600,
+    });
+    if (!phoneRL.allowed) {
+      return reply
+        .code(429)
+        .header('Retry-After', String(phoneRL.retryAfterSeconds))
+        .send({ error: `Too many requests, try again in ${phoneRL.retryAfterSeconds} seconds` });
+    }
+
+    const ipRL = await checkRateLimit({
+      key: `rl:auth-req:ip:${request.ip}`,
+      limit: 10,
+      windowSeconds: 3600,
+    });
+    if (!ipRL.allowed) {
+      return reply
+        .code(429)
+        .header('Retry-After', String(ipRL.retryAfterSeconds))
+        .send({ error: `Too many requests, try again in ${ipRL.retryAfterSeconds} seconds` });
     }
 
     try {
