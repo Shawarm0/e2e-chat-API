@@ -26,3 +26,7 @@ export function clearLocalSocket(deviceId: string, socket: WebSocket): void {
 export function getLocalSocket(deviceId: string): WebSocket | undefined {
   return localSockets.get(deviceId);
 }
+
+export function getLocalDeviceIds(): Iterable<string> {
+  return localSockets.keys();
+}
