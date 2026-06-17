@@ -30,3 +30,7 @@ export function getLocalSocket(deviceId: string): WebSocket | undefined {
 export function getLocalDeviceIds(): Iterable<string> {
   return localSockets.keys();
 }
+
+export function getAllLocalSockets(): ReadonlyMap<string, WebSocket> {
+  return localSockets;
+}

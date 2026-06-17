@@ -9,3 +9,7 @@ if (!connectionString) {
 
 const queryClient = postgres(connectionString);
 export const db = drizzle(queryClient, { schema });
+
+export async function closeDb(): Promise<void> {
+  await queryClient.end();
+}

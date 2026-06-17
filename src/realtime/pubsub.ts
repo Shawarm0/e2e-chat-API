@@ -70,3 +70,9 @@ export async function publishToInstance(
 ): Promise<void> {
   await publisher.publish(channelFor(instanceId), JSON.stringify(payload));
 }
+
+export async function closePubSub(): Promise<void> {
+  await subscriber.unsubscribe();
+  subscriber.disconnect();
+  publisher.disconnect();
+}
