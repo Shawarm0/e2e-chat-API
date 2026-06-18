@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { redis } from '../redis/client.js';
 
-const SESSION_PREFIX = 'session';
+const SESSION_PREFIX = 'session:';
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 
 export interface SessionData {

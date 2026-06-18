@@ -82,7 +82,7 @@ export async function messageRoutes(fastify: FastifyInstance) {
     // this is the fast path, not the only path.
     const deliveryStatus = await deliverToDevice(data.recipientDeviceId, message);
 
-    return reply.code(201).send({ message });
+    return reply.code(201).send({ message, delivery: deliveryStatus });
   });
 
   // GET /messages?deviceId=...&since=...&limit=... — fetch undelivered messages.

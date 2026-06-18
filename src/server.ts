@@ -60,6 +60,8 @@ async function shutdown(signal: string): Promise<void> {
   try {
     await fastify.close();
 
+    const deviceIdsToOffline = Array.from(getLocalDeviceIds());
+
     for (const [, socket] of getAllLocalSockets()) {
       try {
         socket.close(1001, 'server shutting down');
@@ -70,7 +72,7 @@ async function shutdown(signal: string): Promise<void> {
 
     clearInterval(presenceInterval);
 
-    for (const deviceId of getLocalDeviceIds()) {
+    for (const deviceId of deviceIdsToOffline) {
       await markOffline(deviceId);
     }
 
