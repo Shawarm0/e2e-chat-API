@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 import { and, eq, isNull, inArray, asc, gt } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { devices, messages } from '../db/schema.js';
@@ -12,6 +13,7 @@ const sendMessageSchema = z.object({
   recipientDeviceId: z.string().uuid(),
   ciphertext: z.string().min(1).max(65536),
   messageType: z.number().int().min(0).max(255).default(0),
+  ephemeral: z.boolean().optional().default(false),
 });
 
 const fetchQuerySchema = z.object({
@@ -68,6 +70,23 @@ export async function messageRoutes(fastify: FastifyInstance) {
       return reply.code(404).send({ error: 'Recipient device not found' });
     }
 
+    if (data.ephemeral) {
+      const syntheticMessage = {
+        id: randomUUID(),
+        senderDeviceId: data.senderDeviceId,
+        recipientDeviceId: data.recipientDeviceId,
+        ciphertext: data.ciphertext,
+        messageType: data.messageType,
+        createdAt: new Date(),
+        deliveredAt: null,
+        ephemeral: true,
+      };
+
+      const result = await deliverToDevice(data.recipientDeviceId, syntheticMessage);
+      const delivery = result === 'offline' ? 'dropped' : result;
+      return reply.code(201).send({ delivery });
+    }
+
     const [message] = await db
       .insert(messages)
       .values({
@@ -78,8 +97,6 @@ export async function messageRoutes(fastify: FastifyInstance) {
       })
       .returning();
 
-    // Attempt realtime push. The message is already durable in Postgres;
-    // this is the fast path, not the only path.
     const deliveryStatus = await deliverToDevice(data.recipientDeviceId, message);
 
     return reply.code(201).send({ message, delivery: deliveryStatus });
