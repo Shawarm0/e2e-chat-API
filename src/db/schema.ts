@@ -4,6 +4,7 @@ export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
   phoneNumber: text('phone_number').notNull().unique(),
   displayName: text('display_name'),
+  presenceVisibility: text('presence_visibility').notNull().default('everyone'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
 

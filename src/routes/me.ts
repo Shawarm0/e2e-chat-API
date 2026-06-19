@@ -6,7 +6,10 @@ import { users } from '../db/schema.js';
 import { requireAuth } from '../auth/requireAuth.js';
 
 const updateMeSchema = z.object({
-  displayName: z.string().min(1).max(50),
+  displayName: z.string().min(1).max(50).optional(),
+  presenceVisibility: z.enum(['everyone', 'nobody']).optional(),
+}).refine(data => data.displayName !== undefined || data.presenceVisibility !== undefined, {
+  message: 'At least one field must be provided',
 });
 
 export async function meRoutes(fastify: FastifyInstance) {
@@ -30,9 +33,13 @@ export async function meRoutes(fastify: FastifyInstance) {
       return reply.code(400).send({ error: 'Invalid request body', issues: parsed.error.issues });
     }
 
+    const updates: Partial<{ displayName: string; presenceVisibility: string }> = {};
+    if (parsed.data.displayName !== undefined) updates.displayName = parsed.data.displayName;
+    if (parsed.data.presenceVisibility !== undefined) updates.presenceVisibility = parsed.data.presenceVisibility;
+
     const [user] = await db
       .update(users)
-      .set({ displayName: parsed.data.displayName })
+      .set(updates)
       .where(eq(users.id, session.userId))
       .returning();
 

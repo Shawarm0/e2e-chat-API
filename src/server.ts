@@ -7,6 +7,7 @@ import { keyRoutes } from './routes/keys.js';
 import { messageRoutes } from './routes/messages.js';
 import { wsRoutes } from './routes/ws.js';
 import { userRoutes } from './routes/users.js';
+import { presenceRoutes } from './routes/presence.js';
 import { INSTANCE_ID } from './realtime/instance.js';
 import { initPubSub, closePubSub } from './realtime/pubsub.js';
 import { startPresenceRefresher, markOffline } from './realtime/presence.js';
@@ -27,6 +28,7 @@ await fastify.register(keyRoutes);
 await fastify.register(messageRoutes);
 await fastify.register(wsRoutes);
 await fastify.register(userRoutes);
+await fastify.register(presenceRoutes);
 
 const port = Number(process.env.PORT) || 3000;
 const host = '0.0.0.0';

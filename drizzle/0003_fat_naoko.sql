@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "presence_visibility" text DEFAULT 'everyone' NOT NULL;
