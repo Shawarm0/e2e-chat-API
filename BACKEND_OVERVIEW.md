@@ -41,10 +41,11 @@ src/
 ├── routes/
 │   ├── health.ts             GET /health
 │   ├── auth.ts               POST /auth/request-code, POST /auth/verify-code
-│   ├── me.ts                 GET /me (protected)
+│   ├── me.ts                 GET /me, PATCH /me (protected)
 │   ├── devices.ts            POST /devices, POST /devices/:deviceId/prekeys
 │   ├── keys.ts               GET /keys/:userId (consumes a one-time prekey)
 │   ├── messages.ts           POST /messages, GET /messages, POST /messages/ack
+│   ├── presence.ts           GET /users/:userId/presence
 │   └── ws.ts                 GET /ws (WebSocket: auth frame, message frames, ack frames)
 ├── sessions/
 │   └── store.ts              createSession, getSession, revokeSession (Redis-backed)
@@ -136,17 +137,18 @@ Client (authenticated) sends: `GET /keys/:userId`.
 
 ### Flow 5: sending a message (REST)
 
-Client (authenticated) sends: `POST /messages` with `{ senderDeviceId, recipientDeviceId, ciphertext, messageType }`.
+Client (authenticated) sends: `POST /messages` with `{ senderDeviceId, recipientDeviceId, ciphertext, messageType, ephemeral? }`.
 
 1. Handler in `src/routes/messages.ts` validates input.
 2. Verifies sender device belongs to the authenticated user.
 3. Verifies recipient device exists (any user).
-4. INSERTs into `messages` (`delivered_at` defaults to `null`).
-5. Calls `deliverToDevice(recipientDeviceId, message)`:
+4. If `ephemeral: true`: skips the database insert entirely. Builds a synthetic message object with a random UUID and an `ephemeral: true` marker, then attempts delivery. If the recipient is offline the message is silently dropped — returns `{ delivery: 'dropped' }`. Ephemeral messages are used by clients for read receipts and typing indicators (things that shouldn't persist).
+5. If not ephemeral (default): INSERTs into `messages` (`delivered_at` defaults to `null`).
+6. Calls `deliverToDevice(recipientDeviceId, message)`:
    - First checks local socket Map. If found, writes the JSON frame and returns `"delivered_local"`.
    - Otherwise looks up `presence:device:<id>` in Redis to find which instance the device is connected to. If a remote instance, publishes to `instance:<that_uuid>` and returns `"delivered_remote"`.
    - If no socket and no presence, returns `"offline"`. Message stays in Postgres for the recipient to fetch later.
-6. Returns `{ message, delivery }` with HTTP 201.
+7. Returns `{ message, delivery }` with HTTP 201 (or `{ delivery }` only for ephemeral).
 
 ### Flow 6: realtime delivery (WebSocket)
 
@@ -165,11 +167,58 @@ Client opens `wss://.../ws`.
 On disconnect (`socket.on('close')`):
 - Local socket Map entry cleared.
 - Presence key in Redis deleted (but only if we still own it — defends against reconnect races).
-- The 30s presence refresher stops touching the key.
+- `devices.lastSeen` updated in Postgres (fire-and-forget — failures are logged but don't block shutdown).
+- The 30s presence refresher stops touching the key. While connected, the refresher also bulk-updates `lastSeen` for all active devices every 30 seconds, so a hard crash doesn't leave `lastSeen` permanently stale.
 
 ### Flow 7: catching up via REST (when WebSocket isn't available)
 
 `GET /messages?deviceId=...&since=...&limit=...` returns undelivered messages for the device, ordered by `createdAt` ascending. `POST /messages/ack` flips `delivered_at`. This is the REST fallback for clients without a live WebSocket. Same storage, different channel.
+
+### Flow 8: querying presence
+
+Client (authenticated) sends: `GET /users/:userId/presence`.
+
+1. Handler in `src/routes/presence.ts` validates the target userId.
+2. Rate-limited at 60 requests/minute per calling user.
+3. Checks the target user's `presenceVisibility` setting. If `'nobody'`, returns `{ online: false, lastSeen: null }` — indistinguishable from a genuinely offline user, which prevents probing.
+4. Looks up all devices for the target user.
+5. For each device, checks `presence:device:<id>` in Redis. If any key exists, the user is online.
+6. If no device is online, returns the latest `lastSeen` timestamp across all their devices.
+7. Response: `{ online: boolean, lastSeen: string | null }`.
+
+Users can control their own visibility via `PATCH /me` with `{ presenceVisibility: 'everyone' | 'nobody' }`.
+
+---
+
+## Client-side conventions
+
+Some "chat features" live entirely in the client. The server sees them as ordinary (or ephemeral) messages with opaque ciphertext — it doesn't know what's inside.
+
+### Read receipts
+
+When a client receives and displays a regular text message, it sends a read receipt back to the sender as an ephemeral message. The decrypted JSON payload inside the ciphertext:
+
+```json
+{ "type": "read_receipt", "messageIds": ["<uuid>"], "readAt": "<ISO 8601>" }
+```
+
+Because it uses `ephemeral: true`, the receipt is dropped if the sender is offline — no stale receipts accumulate. The sender's client detects the structured JSON by attempting to parse decrypted plaintext; if `type` is `"read_receipt"`, it updates the local message state rather than displaying it as a chat message.
+
+### Typing indicators
+
+While a user is typing, their client sends ephemeral messages with:
+
+```json
+{ "type": "typing", "state": "started" }
+```
+
+When the user sends the message (or stops typing), the client sends:
+
+```json
+{ "type": "typing", "state": "stopped" }
+```
+
+Both use `ephemeral: true`. The receiving client shows a "typing..." indicator and auto-clears it after 10 seconds (safety net for crashes or network drops). Typing indicators are never persisted.
 
 ---
 
@@ -204,16 +253,22 @@ Deployment flow: `git push` → CI runs (`npm ci`, lint, type-check, build) → 
 
 ---
 
+## Operations
+
+- **`scripts/cleanup-used-prekeys.ts`** — deletes one-time prekeys that were consumed more than 90 days ago. Run with `npx tsx scripts/cleanup-used-prekeys.ts`.
+- **`scripts/cleanup-delivered-messages.ts`** — deletes messages where `delivered_at` is older than 7 days. Run with `npx tsx scripts/cleanup-delivered-messages.ts`. Wire to a Railway cron for automatic cleanup.
+
+---
+
 ## What's not built yet
 
 Roughly in the order they'd be added:
 
-- **Hardening continued** — rate limiting on `/auth/*`, abuse handling, separation of dev and prod databases, cleanup cron for used prekeys, structured error logging.
+- **Hardening continued** — abuse handling, separation of dev and prod databases, structured error logging.
 - **Multi-device fan-out for `GET /keys/:userId`** — return all of a user's devices in one bundle. See appendix.
 - **Groups** — `groups` and `group_members` tables, sender-key distribution, fan-out per group send. See appendix.
 - **Media** — encrypted file uploads to object storage, referenced from message ciphertexts.
 - **Push notifications** — APNs/FCM wake-ups for offline devices.
-- **A real client** — replace the base64 stub with a real Signal Protocol client (libsignal-client) on a mobile or web platform.
 
 ---
 
