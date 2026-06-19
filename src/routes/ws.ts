@@ -139,6 +139,13 @@ export async function wsRoutes(fastify: FastifyInstance) {
       if (authedDeviceId) {
         clearLocalSocket(authedDeviceId, socket);
         await markOffline(authedDeviceId);
+        db.update(devices)
+          .set({ lastSeen: new Date() })
+          .where(eq(devices.id, authedDeviceId))
+          .then(() => {})
+          .catch((err: unknown) => {
+            wsLog.error({ err, deviceId: authedDeviceId }, 'Failed to update lastSeen on disconnect');
+          });
       }
     });
 
