@@ -5,10 +5,10 @@ import { db } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { requireAuth } from '../auth/requireAuth.js';
 import { checkRateLimit } from '../ratelimit/limiter.js';
-import { validateAndNormalizePhone } from '../validation/phone.js';
+import { validateAndNormalizeEmail } from '../validation/email.js';
 
 const lookupQuerySchema = z.object({
-  phoneNumber: z.string().min(1),
+  email: z.string().min(1),
 });
 
 export async function userRoutes(fastify: FastifyInstance) {
@@ -17,12 +17,12 @@ export async function userRoutes(fastify: FastifyInstance) {
 
     const parsed = lookupQuerySchema.safeParse(request.query);
     if (!parsed.success) {
-      return reply.code(400).send({ error: 'phoneNumber query parameter is required' });
+      return reply.code(400).send({ error: 'email query parameter is required' });
     }
 
-    const phoneResult = validateAndNormalizePhone(parsed.data.phoneNumber);
-    if (!phoneResult.valid) {
-      return reply.code(400).send({ error: phoneResult.reason });
+    const emailResult = validateAndNormalizeEmail(parsed.data.email);
+    if (!emailResult.valid) {
+      return reply.code(400).send({ error: emailResult.reason });
     }
 
     const rl = await checkRateLimit({
@@ -40,11 +40,11 @@ export async function userRoutes(fastify: FastifyInstance) {
     const [user] = await db
       .select({
         id: users.id,
-        phoneNumber: users.phoneNumber,
+        email: users.email,
         displayName: users.displayName,
       })
       .from(users)
-      .where(eq(users.phoneNumber, phoneResult.e164))
+      .where(eq(users.email, emailResult.email))
       .limit(1);
 
     if (!user) {

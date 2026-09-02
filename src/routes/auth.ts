@@ -1,119 +1,132 @@
-import type { FastifyInstance } from 'fastify';
-import { sendVerificationCode, checkVerificationCode } from '../twilio/client.js';
+import type { FastifyInstance, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { users } from '../db/schema.js';
+import { users, publicUserColumns } from '../db/schema.js';
 import { createSession } from '../sessions/store.js';
-import { checkRateLimit } from '../ratelimit/limiter.js';
-import { validateAndNormalizePhone } from '../validation/phone.js';
+import { checkRateLimit, type RateLimitResult } from '../ratelimit/limiter.js';
+import { validateAndNormalizeEmail } from '../validation/email.js';
+import {
+  hashPassword,
+  verifyPassword,
+  MIN_PASSWORD_LENGTH,
+  MAX_PASSWORD_LENGTH,
+} from '../auth/password.js';
+
+const credentialsSchema = z.object({
+  email: z.string().min(1),
+  password: z.string().min(MIN_PASSWORD_LENGTH).max(MAX_PASSWORD_LENGTH),
+});
+
+const registerSchema = credentialsSchema.extend({
+  displayName: z.string().min(1).max(50).optional(),
+});
+
+// A real hash of a value nobody can supply. Verifying against it on a missing
+// email keeps the failed-login timing the same whether or not the account exists.
+const DUMMY_HASH =
+  'scrypt$16384$8$1$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+
+function tooManyRequests(reply: FastifyReply, rl: RateLimitResult) {
+  return reply
+    .code(429)
+    .header('Retry-After', String(rl.retryAfterSeconds))
+    .send({ error: `Too many requests, try again in ${rl.retryAfterSeconds} seconds` });
+}
 
 export async function authRoutes(fastify: FastifyInstance) {
-  fastify.post<{
-    Body: { phoneNumber: string };
-  }>('/auth/request-code', async (request, reply) => {
-    const { phoneNumber: rawPhone } = request.body;
-
-    if (!rawPhone) {
-      return reply.code(400).send({ error: 'phoneNumber is required' });
+  // POST /auth/register — create an account and return a session for it.
+  fastify.post('/auth/register', async (request, reply) => {
+    const parsed = registerSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: `email and password are required; password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters`,
+        issues: parsed.error.issues,
+      });
     }
 
-    const phoneResult = validateAndNormalizePhone(rawPhone);
-    if (!phoneResult.valid) {
-      return reply.code(400).send({ error: phoneResult.reason });
+    const emailResult = validateAndNormalizeEmail(parsed.data.email);
+    if (!emailResult.valid) {
+      return reply.code(400).send({ error: emailResult.reason });
     }
-    const phoneNumber = phoneResult.e164;
+    const email = emailResult.email;
 
-    const phoneRL = await checkRateLimit({
-      key: `rl:auth-req:phone:${phoneNumber}`,
+    const emailRL = await checkRateLimit({
+      key: `rl:auth-register:email:${email}`,
       limit: 3,
       windowSeconds: 3600,
     });
-    if (!phoneRL.allowed) {
-      return reply
-        .code(429)
-        .header('Retry-After', String(phoneRL.retryAfterSeconds))
-        .send({ error: `Too many requests, try again in ${phoneRL.retryAfterSeconds} seconds` });
-    }
+    if (!emailRL.allowed) return tooManyRequests(reply, emailRL);
 
     const ipRL = await checkRateLimit({
-      key: `rl:auth-req:ip:${request.ip}`,
+      key: `rl:auth-register:ip:${request.ip}`,
       limit: 10,
       windowSeconds: 3600,
     });
-    if (!ipRL.allowed) {
-      return reply
-        .code(429)
-        .header('Retry-After', String(ipRL.retryAfterSeconds))
-        .send({ error: `Too many requests, try again in ${ipRL.retryAfterSeconds} seconds` });
+    if (!ipRL.allowed) return tooManyRequests(reply, ipRL);
+
+    const passwordHash = await hashPassword(parsed.data.password);
+
+    // The unique index on email is what actually decides the race between two
+    // simultaneous signups; DO NOTHING lets us detect the loser without an error.
+    const [user] = await db
+      .insert(users)
+      .values({ email, passwordHash, displayName: parsed.data.displayName })
+      .onConflictDoNothing({ target: users.email })
+      .returning(publicUserColumns);
+
+    if (!user) {
+      return reply.code(409).send({ error: 'An account with that email already exists' });
     }
 
-    try {
-      const verification = await sendVerificationCode(phoneNumber);
-      return reply.code(200).send({ status: verification.status });
-    } catch (err) {
-      request.log.error({ err, phoneNumber }, 'Failed to send verification code');
-      return reply.code(500).send({ error: 'Failed to send verification code' });
-    }
+    const sessionToken = await createSession(user.id);
+
+    return reply.code(201).send({ user, sessionToken });
   });
 
-  fastify.post<{
-    Body: { phoneNumber: string; code: string };
-  }>('/auth/verify-code', async (request, reply) => {
-    const { phoneNumber: rawPhone, code } = request.body;
-
-    if (!rawPhone || !code) {
-      return reply.code(400).send({ error: 'phoneNumber and code are required' });
+  // POST /auth/login — exchange credentials for a session token.
+  fastify.post('/auth/login', async (request, reply) => {
+    const parsed = credentialsSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'email and password are required' });
     }
 
-    const phoneResult = validateAndNormalizePhone(rawPhone);
-    if (!phoneResult.valid) {
-      return reply.code(400).send({ error: phoneResult.reason });
+    const emailResult = validateAndNormalizeEmail(parsed.data.email);
+    if (!emailResult.valid) {
+      return reply.code(401).send({ error: 'Invalid email or password' });
     }
-    const phoneNumber = phoneResult.e164;
+    const email = emailResult.email;
 
-    const phoneRL = await checkRateLimit({
-      key: `rl:auth-verify:phone:${phoneNumber}`,
+    const emailRL = await checkRateLimit({
+      key: `rl:auth-login:email:${email}`,
       limit: 10,
       windowSeconds: 3600,
     });
-    if (!phoneRL.allowed) {
-      return reply
-        .code(429)
-        .header('Retry-After', String(phoneRL.retryAfterSeconds))
-        .send({ error: `Too many requests, try again in ${phoneRL.retryAfterSeconds} seconds` });
-    }
+    if (!emailRL.allowed) return tooManyRequests(reply, emailRL);
 
     const ipRL = await checkRateLimit({
-      key: `rl:auth-verify:ip:${request.ip}`,
+      key: `rl:auth-login:ip:${request.ip}`,
       limit: 30,
       windowSeconds: 3600,
     });
-    if (!ipRL.allowed) {
-      return reply
-        .code(429)
-        .header('Retry-After', String(ipRL.retryAfterSeconds))
-        .send({ error: `Too many requests, try again in ${ipRL.retryAfterSeconds} seconds` });
-    }
+    if (!ipRL.allowed) return tooManyRequests(reply, ipRL);
 
-    let verification;
-    try {
-      verification = await checkVerificationCode(phoneNumber, code);
-    } catch (err) {
-      request.log.error({ err, phoneNumber }, 'Failed to check verification code');
-      return reply.code(500).send({ error: 'Failed to check verification code' });
-    }
+    const [row] = await db
+      .select({ id: users.id, passwordHash: users.passwordHash })
+      .from(users)
+      .where(eq(users.email, email))
+      .limit(1);
 
-    if (verification.status !== 'approved') {
-      return reply.code(401).send({ error: 'Invalid code' });
+    const matches = await verifyPassword(parsed.data.password, row?.passwordHash ?? DUMMY_HASH);
+    if (!row || !matches) {
+      return reply.code(401).send({ error: 'Invalid email or password' });
     }
 
     const [user] = await db
-      .insert(users)
-      .values({ phoneNumber })
-      .onConflictDoUpdate({
-        target: users.phoneNumber,
-        set: { phoneNumber },
-      })
-      .returning();
+      .select(publicUserColumns)
+      .from(users)
+      .where(eq(users.id, row.id))
+      .limit(1);
 
     const sessionToken = await createSession(user.id);
 

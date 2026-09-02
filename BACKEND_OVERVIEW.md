@@ -6,7 +6,7 @@ A tour of what exists, where it lives, and which code runs when.
 
 ## Current state
 
-A Fastify backend in TypeScript, deployed to Railway. Supports phone-number authentication via Twilio Verify, session tokens stored in Redis, device registration with Signal-Protocol-shaped cryptographic keys, prekey bundle distribution, message storage and delivery, and a realtime WebSocket layer that pushes messages to connected devices.
+A Fastify backend in TypeScript, deployed to Railway. Supports email and password authentication with scrypt-hashed passwords, session tokens stored in Redis, device registration with Signal-Protocol-shaped cryptographic keys, prekey bundle distribution, message storage and delivery, and a realtime WebSocket layer that pushes messages to connected devices.
 
 The server never sees plaintext. It stores ciphertext blobs, hands out public keys, and routes opaque messages between device "mailboxes." All encryption work happens on clients (when there are real clients).
 
@@ -16,7 +16,7 @@ The server never sees plaintext. It stores ciphertext blobs, hands out public ke
 - **@fastify/websocket** — WebSocket plugin layered on top.
 - **Drizzle ORM** + **postgres** — typed database access against PostgreSQL.
 - **ioredis** — Redis client for sessions, presence, and pub/sub.
-- **Twilio Verify** — SMS one-time code delivery and validation.
+- **node:crypto scrypt** — password hashing. No third-party dependency.
 - **Zod** — request validation.
 - **TypeScript** + **tsx** — types in dev, compiled JS for production.
 
@@ -26,7 +26,8 @@ The server never sees plaintext. It stores ciphertext blobs, hands out public ke
 src/
 ├── server.ts                 entry point — boots Fastify, registers routes, starts realtime
 ├── auth/
-│   └── requireAuth.ts        hook that validates session tokens on protected REST routes
+│   ├── requireAuth.ts        hook that validates session tokens on protected REST routes
+│   └── password.ts           scrypt hashing and constant-time verification
 ├── db/
 │   ├── client.ts             opens the Postgres connection
 │   └── schema.ts             users, devices, prekeys, signed_prekeys, messages
@@ -40,7 +41,7 @@ src/
 │   └── delivery.ts           "deliver to device wherever it is" composed helper
 ├── routes/
 │   ├── health.ts             GET /health
-│   ├── auth.ts               POST /auth/request-code, POST /auth/verify-code
+│   ├── auth.ts               POST /auth/register, POST /auth/login
 │   ├── me.ts                 GET /me, PATCH /me (protected)
 │   ├── devices.ts            POST /devices, POST /devices/:deviceId/prekeys
 │   ├── keys.ts               GET /keys/:userId (consumes a one-time prekey)
@@ -49,8 +50,8 @@ src/
 │   └── ws.ts                 GET /ws (WebSocket: auth frame, message frames, ack frames)
 ├── sessions/
 │   └── store.ts              createSession, getSession, revokeSession (Redis-backed)
-└── twilio/
-    └── client.ts             sendVerificationCode, checkVerificationCode
+└── validation/
+    └── email.ts              validates and lower-cases addresses before storage
 ```
 
 ### Environment variables
@@ -59,7 +60,6 @@ Loaded from `.env` locally (gitignored) and set in the Railway dashboard in prod
 
 - `DATABASE_URL` — Postgres connection string.
 - `REDIS_URL` — Redis connection string.
-- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_VERIFY_SERVICE_SID` — Twilio credentials.
 - `PORT` — set by Railway in production; defaults to 3000 locally.
 
 Every module that needs these reads `process.env` at startup and crashes immediately if anything's missing. Fail-fast on misconfiguration.
@@ -70,39 +70,41 @@ Every module that needs these reads `process.env` at startup and crashes immedia
 
 When the server process boots:
 
-1. **`src/server.ts` runs.** It imports route modules and realtime helpers. Each import triggers module initialisation, opening the Postgres pool, Redis connection, Twilio client, and pub/sub connections.
+1. **`src/server.ts` runs.** It imports route modules and realtime helpers. Each import triggers module initialisation, opening the Postgres pool, Redis connection, and pub/sub connections.
 2. **`INSTANCE_ID` is generated** — a random UUID unique to this process. Used as the value in presence keys.
 3. **Routes are registered** via `fastify.register(...)`. Each `routes/*.ts` module attaches its handlers.
 4. **`initPubSub()` runs.** Subscribes the process to its own `instance:<id>` Redis channel. Other instances will publish there to route messages across processes.
 5. **`startPresenceRefresher(...)` runs.** Sets up a recurring task that re-writes the TTL on every locally-connected device's presence key every 30 seconds.
 6. **`fastify.listen(...)`** opens the HTTP socket. Both REST and WebSocket connections come in here; Fastify handles the upgrade for `/ws` automatically.
 
-After this, the process sits in the Node event loop. Connections to Postgres, Redis (one for normal commands, two more for pub/sub), and Twilio stay open in the background.
+After this, the process sits in the Node event loop. Connections to Postgres and Redis (one for normal commands, two more for pub/sub) stay open in the background.
 
 ---
 
 ## User flows
 
-### Flow 1: requesting an SMS code
+### Flow 1: creating an account
 
-Client sends: `POST /auth/request-code` with body `{ "phoneNumber": "+447..." }`.
+Client sends: `POST /auth/register` with body `{ "email", "password", "displayName"? }`.
 
-1. Handler in `src/routes/auth.ts` runs.
-2. Validates the body (Zod).
-3. Calls `sendVerificationCode(phone)` in `src/twilio/client.ts`.
-4. Twilio generates the code, sends the SMS, returns `{status: "pending"}`.
-5. Handler returns `{ "status": "pending" }` with HTTP 200.
+1. Handler in `src/routes/auth.ts` validates the body (Zod). Passwords are 8–200 characters.
+2. The email is trimmed and lower-cased by `validateAndNormalizeEmail`, so addresses are unique case-insensitively.
+3. Rate limits: 3 registrations per hour per email, 10 per hour per IP.
+4. `hashPassword` derives a scrypt hash (N=16384, r=8, p=1) with a fresh 16-byte salt. The stored string is `scrypt$N$r$p$salt$hash`, so the parameters travel with the hash and can be raised later without invalidating old rows.
+5. `INSERT ... ON CONFLICT DO NOTHING` on the unique email index. No row back means the address is taken → 409.
+6. `createSession(userId)` generates a 32-byte random token, stores it in Redis as `session:<token> → JSON` with 30-day TTL.
+7. Returns `{ user, sessionToken }` with HTTP 201. `password_hash` is never in a response body — every route selects `publicUserColumns`.
 
-### Flow 2: verifying the code
+### Flow 2: signing in
 
-Client sends: `POST /auth/verify-code` with body `{ "phoneNumber", "code" }`.
+Client sends: `POST /auth/login` with body `{ "email", "password" }`.
 
-1. Handler validates input.
-2. Calls `checkVerificationCode(phone, code)`. Twilio responds with `status: "approved"` or `"pending"` (latter on wrong code or expired).
-3. Not approved → 401.
-4. Approved → atomic upsert on `users` (`INSERT ... ON CONFLICT DO UPDATE ... RETURNING`). Returns the user, new or existing.
-5. `createSession(userId)` generates a 32-byte random token, stores it in Redis as `session:<token> → JSON` with 30-day TTL.
-6. Returns `{ user, sessionToken }`.
+1. Handler validates and normalises the email. Rate limits: 10 attempts per hour per email, 30 per hour per IP.
+2. Looks up the user's `password_hash` by email.
+3. `verifyPassword` re-derives the hash using the parameters embedded in the stored string and compares with `timingSafeEqual`. If the email is unknown it verifies against a dummy hash anyway, so a missing account and a wrong password take the same time and return the same 401.
+4. Success → `createSession(userId)`, returns `{ user, sessionToken }`.
+
+Accounts that predate this flow (created by SMS verification) were backfilled by migration `0004` with a placeholder `@legacy.invalid` address and a sentinel password hash that cannot verify. They own their old devices and messages but cannot sign in; there is no password reset flow yet.
 
 ### Flow 3: registering a device
 
@@ -224,7 +226,7 @@ Both use `ephemeral: true`. The receiving client shows a "typing..." indicator a
 
 ## How the pieces share state
 
-- **Connection objects** (`db`, `redis`, Twilio client, pub/sub clients) are module-scope singletons created once at process startup. Route files import them.
+- **Connection objects** (`db`, `redis`, pub/sub clients) are module-scope singletons created once at process startup. Route files import them.
 - **Per-request state** lives on Fastify's `request` object — `request.session` for REST routes after `requireAuth`. For WebSocket connections, the per-connection state (`authedDeviceId`) lives in the closure of the connection handler.
 - **Cross-request, durable state** (users, devices, keys, messages) lives in Postgres.
 - **Cross-request, ephemeral state** (sessions, presence, pending operations) lives in Redis. Auto-expires via TTL.

@@ -8,7 +8,7 @@ End-to-end encrypted chat backend, work in progress.
 - Fastify
 - PostgreSQL via Drizzle ORM
 - Redis (ioredis)
-- Twilio Verify for phone auth
+- Email + password auth (scrypt via `node:crypto`)
 - Deployed on Railway
 
 ## Scripts
@@ -55,7 +55,16 @@ psql postgresql://postgres@127.0.0.1:5432/e2e_chat_dev
 `npm run db:seed` wipes and reloads the seed data, so it is safe to re-run. It
 covers five users (multi-device, single-device and no-device), signed and
 one-time prekeys with some already claimed, a delivered message thread, and an
-undelivered backlog. See `scripts/seed-local.ts`.
+undelivered backlog. See `scripts/seed-local.ts`. Every seeded account signs in
+with the password `password123` — for example `ada@example.com`.
+
+## Authentication
+
+`POST /auth/register` with `{ email, password, displayName? }` creates an account and
+returns a session token; `POST /auth/login` with `{ email, password }` returns one for
+an existing account. Send it as `Authorization: Bearer <token>` on every other route.
+Passwords are 8-200 characters, hashed with scrypt from `node:crypto` — no external
+auth service is involved.
 
 ## Environment variables
 
