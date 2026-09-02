@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "dotenv -e .env -- tsx watch src/server.ts",
+    "dev:local": "dotenv -e .env.local -- tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "db:generate": "drizzle-kit generate",
@@ -12,7 +13,9 @@
     "db:studio": "dotenv -e .env -- drizzle-kit studio",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "db:seed": "dotenv -e .env.local -- tsx scripts/seed-local.ts",
+    "db:studio:local": "dotenv -e .env.local -- drizzle-kit studio"
   },
   "keywords": [],
   "author": "",
