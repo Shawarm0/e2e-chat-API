@@ -13,6 +13,7 @@ import { initPubSub, closePubSub } from './realtime/pubsub.js';
 import { startPresenceRefresher, markOffline } from './realtime/presence.js';
 import { getLocalDeviceIds, getAllLocalSockets } from './realtime/registry.js';
 import { closeDb } from './db/client.js';
+import { runMigrations } from './db/migrate.js';
 import { redis } from './redis/client.js';
 
 const fastify = Fastify({
@@ -36,6 +37,7 @@ const host = '0.0.0.0';
 let presenceInterval: NodeJS.Timeout;
 
 try {
+  await runMigrations();
   await initPubSub();
   presenceInterval = startPresenceRefresher(getLocalDeviceIds);
   fastify.log.info({ instanceId: INSTANCE_ID }, 'instance booted');
